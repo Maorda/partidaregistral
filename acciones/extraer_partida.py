@@ -1,6 +1,8 @@
+# Archivo: acciones/extraer_partida.py
 import nodriver as uc
+
 # Importación ultra limpia gracias a __init__.py
-from sunarp.acciones import (
+from acciones import (
     seleccionar_oficina,
     seleccionar_area,
     configurar_criterio_partida,
