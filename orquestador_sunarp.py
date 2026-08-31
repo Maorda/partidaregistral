@@ -7,16 +7,17 @@ import re
 from datetime import datetime
 import nodriver as uc
 
-# Importación correcta y explícita de la función de extracción
 from acciones.extraer_partida import extraer_partida
 from acciones.pre_extraer_partida.iniciar_session import iniciar_sesion
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ARCHIVO_CREDENCIALES = os.path.join(BASE_DIR, "..", "buscardniperu", "credenciales.json")
 ARCHIVO_PARTIDAS = os.path.join(BASE_DIR, "partidas.json")
+ARCHIVO_OFICINAS = os.path.join(BASE_DIR, "oficina_registral.json") # 💡 Ruta al archivo JSON
 
 LIMITE_INGRESOS = 5
 TIEMPO_MAX_SESION = 9 * 60  # 9 minutos por sesión
+MAX_INTENTOS_PARTIDA = 3    # Límite de reintentos para partidas con error
 
 def extraer_codigo_oficina(expediente: str) -> str:
     """Extrae el código de oficina (ej: '2501') del número de expediente."""
@@ -30,6 +31,23 @@ def extraer_codigo_oficina(expediente: str) -> str:
     if len(partes) >= 4:
         return partes[3]
     return "N/A"
+
+def cargar_oficinas():
+    """Carga la lista de oficinas registrales desde oficina_registral.json."""
+    ruta_limpia = os.path.normpath(ARCHIVO_OFICINAS)
+    try:
+        with open(ruta_limpia, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"[!] ADVERTENCIA: No se encontró el archivo '{ARCHIVO_OFICINAS}'. Se usarán códigos numéricos.")
+        return []
+
+def obtener_nombre_oficina(codigo: str, lista_oficinas: list) -> str:
+    """Traduce el código numérico de oficina (ej: '2501') a su nombre en texto ('CHIMBOTE')."""
+    for oficina in lista_oficinas:
+        if oficina.get("codigo") == codigo:
+            return oficina.get("nombre", codigo)
+    return codigo  # Si no lo encuentra, devuelve el código numérico original
 
 def cargar_partidas():
     ruta_limpia = os.path.normpath(ARCHIVO_PARTIDAS)
@@ -58,18 +76,13 @@ def guardar_credenciales(credenciales):
         json.dump(credenciales, f, indent=2, ensure_ascii=False)
 
 def verificar_y_limpiar_bloqueos(credenciales):
-    """
-    Verifica si cambió el día (cruce de las 00:00 horas). 
-    Si la fecha guardada es anterior a hoy, resetea el contador a 0.
-    """
     hoy_str = datetime.now().strftime("%Y-%m-%d")
     hubo_cambios = False
     
     for cred in credenciales:
         fecha_cred = cred.get("fecha_ciclo", "")
-        
         if fecha_cred and fecha_cred < hoy_str:
-            print(f"[INFO] Nuevo día detectado ({hoy_str}). Reseteando DNI {cred['dni']} (fecha anterior: {fecha_cred}).")
+            print(f"[INFO] Nuevo día detectado ({hoy_str}). Reseteando DNI {cred['dni']}.")
             cred["ingresos_ciclo"] = 0
             cred["fecha_ciclo"] = hoy_str
             hubo_cambios = True
@@ -89,25 +102,31 @@ def obtener_dni_disponible(credenciales):
     return None
 
 async def main():
+    # Cargar oficinas desde JSON externo
+    oficinas_registrales = cargar_oficinas()
+    
     credenciales = cargar_credenciales()
     if not credenciales:
         print("[-] No se encontraron credenciales en el archivo JSON.")
         return
         
-    # Verificamos si pasamos las 00:00 y limpiamos contadores obsoletos
     credenciales = verificar_y_limpiar_bloqueos(credenciales)
         
     partidas = cargar_partidas()
     if not partidas:
-        print("[-] No se encontraron partidas pendientes en el archivo JSON.")
+        print("[-] No se encontraron partidas en el archivo JSON.")
         return
 
     abortar_ejecucion = False
 
     while not abortar_ejecucion:
-        pendientes = [p for p in partidas if p.get("estado") == "pendiente"]
+        pendientes = [
+            p for p in partidas 
+            if (p.get("estado") == "pendiente" or (p.get("estado") == "error" and p.get("intentos", 0) < MAX_INTENTOS_PARTIDA))
+        ]
+        
         if not pendientes:
-            print("\n[FIN] Todas las partidas han sido procesadas exitosamente.")
+            print("\n[FIN] No hay más partidas pendientes o reintentables disponibles.")
             break
 
         credencial_actual = obtener_dni_disponible(credenciales)
@@ -126,15 +145,13 @@ async def main():
             credencial_actual["ingresos_ciclo"] += 1
             guardar_credenciales(credenciales)
             
-            # Iniciamos el navegador con nodriver
             browser = await uc.start(browser_args=["--no-sandbox", "--disable-setuid-sandbox"])
             page = browser.main_tab
             
-            # Ejecutar login (maneja modal de términos, turnstile, sesión activa y redirección)
             exito_login = await iniciar_sesion(page, credencial_actual)
             
             if not exito_login:
-                print("\n[ESTADO CRÍTICO] El login falló (posible cambio de estructura o bloqueo).")
+                print("\n[ESTADO CRÍTICO] El login falló.")
                 print("[PROTECCIÓN] Abortando ejecución global para evitar quemar más DNIs.")
                 abortar_ejecucion = True
                 break
@@ -143,24 +160,31 @@ async def main():
             inicio_sesion = time.time()
             
             while not abortar_ejecucion:
-                pendientes_actuales = [p for p in partidas if p.get("estado") == "pendiente"]
+                pendientes_actuales = [
+                    p for p in partidas 
+                    if (p.get("estado") == "pendiente" or (p.get("estado") == "error" and p.get("intentos", 0) < MAX_INTENTOS_PARTIDA))
+                ]
                 if not pendientes_actuales:
                     break
 
                 tiempo_transcurrido = time.time() - inicio_sesion
                 if tiempo_transcurrido > TIEMPO_MAX_SESION:
-                    print("[RELOJ] 9 minutos alcanzados. Cerrando sesión para rotar DNI/limpiar sesión de forma segura.")
+                    print("[RELOJ] 9 minutos alcanzados. Cerrando sesión para rotar DNI.")
                     break
                 
                 item = pendientes_actuales[0]
+                
+                # Extracción y traducción usando la lista cargada del archivo JSON
                 codigo_oficina = extraer_codigo_oficina(item.get("expediente", ""))
+                nombre_oficina = obtener_nombre_oficina(codigo_oficina, oficinas_registrales)
                 
                 item["intentos"] = item.get("intentos", 0) + 1
                 guardar_partidas(partidas)
                 
                 try:
-                    # Llamada correcta a la función de extracción
-                    exito = await extraer_partida(page, codigo_oficina, item['area'], item['partida'])
+                    print(f"\n[PROCESANDO] Partida: {item['partida']} | Oficina: {nombre_oficina} (Código: {codigo_oficina}) [Intento #{item['intentos']}]")
+                    
+                    exito = await extraer_partida(page, nombre_oficina, item['area'], item['partida'])
                     
                     if exito:
                         item["estado"] = "procesado"
@@ -169,7 +193,7 @@ async def main():
                     else:
                         item["estado"] = "error" 
                         item["error"] = "Fallo en verificación/modal de SUNARP"
-                        print(f"[-] Partida {item['partida']} falló durante la ejecución.")
+                        print(f"[-] Partida {item['partida']} marcó error. Podrá ser reintentada.")
                         
                     item["fecha_procesamiento"] = time.strftime("%Y-%m-%d %H:%M:%S")
                     guardar_partidas(partidas)
@@ -181,8 +205,7 @@ async def main():
                     guardar_partidas(partidas)
                 
         except Exception as e:
-            print(f"\n[ERROR CRÍTICO DEL SISTEMA] Ocurrió una excepción no controlada: {e}")
-            print("[PROTECCIÓN] Deteniendo el programa inmediatamente para proteger las credenciales.")
+            print(f"\n[ERROR CRÍTICO DEL SISTEMA] Ocurrió una excepción: {e}")
             abortar_ejecucion = True
             break
             

@@ -16,28 +16,34 @@ async def tipear_lento(elemento, texto: str):
     await asyncio.sleep(uniform(0.2, 0.5))
 
 async def iniciar_sesion(page: uc.Tab, credencial: dict) -> bool:
-    """
-    Función optimizada para login, manejo del modal de sesión abierta,
-    espera pasiva de Turnstile y validación estricta de redirección.
-    """
     print(f"\n[Acción] Navegando a SUNARP: {URL_SUNARP}")
     await page.get(URL_SUNARP)
     
     print("[Acción] Esperando carga inicial de la página...")
-    await asyncio.sleep(uniform(4.0, 5.0))
+    # Damos un poco más de tiempo por si la conexión es lenta
+    await asyncio.sleep(uniform(5.0, 7.0))
     
-    # 1. Manejar el Modal "Sí Acepto"
+    # 1. Manejar el Modal "Sí Acepto" (Mejorado)
     try:
         print("[Acción] Buscando botón 'Sí Acepto' en el modal...")
-        btn_aceptar = await page.select('button.accept-button', timeout=5)
+        # Esperamos hasta 10 segundos para que aparezca el modal
+        btn_aceptar = await page.select('button.accept-button', timeout=10)
+        
         if btn_aceptar:
             await btn_aceptar.click()
-            print("[OK] Botón 'Sí Acepto' presionado. Esperando cierre del modal...")
+            print("[OK] Botón 'Sí Acepto' presionado (por clase css).")
             await asyncio.sleep(uniform(2.0, 3.0))
         else:
-            print("[-] No se encontró el botón del modal (quizás ya no estaba visible).")
+            # Fallback: buscar por el texto si cambiaron la clase
+            btn_txt = await page.find("Acepto", timeout=3)
+            if btn_txt:
+                await btn_txt.click()
+                print("[OK] Botón 'Sí Acepto' presionado (por texto).")
+                await asyncio.sleep(uniform(2.0, 3.0))
+            else:
+                print("[-] No se encontró el botón del modal inicial. Quizás ya no estaba visible.")
     except Exception as e:
-        print(f"[-] Nota sobre el modal: {e}")
+        print(f"[-] Nota sobre el modal inicial: {e}")
 
     # 2. Llenar el formulario de DNI
     print(f"[Acción] Iniciando sesión con DNI: {credencial['dni']}")
@@ -62,7 +68,7 @@ async def iniciar_sesion(page: uc.Tab, credencial: dict) -> bool:
         await tipear_lento(input_fecha, credencial.get('fecha_emision', ''))
         
         # 3. Espera pasiva para Cloudflare Turnstile
-        print("[Acción] Esperando 7 segundos para la validación automática de Cloudflare Turnstile...")
+        print("[Acción] Esperando 7 segundos para la validación de Cloudflare Turnstile...")
         await asyncio.sleep(7.0)
         
         # 4. Presionar Validar
@@ -73,30 +79,30 @@ async def iniciar_sesion(page: uc.Tab, credencial: dict) -> bool:
         print("[Acción] Haciendo clic en el botón 'Validar'...")
         await btn_validar.click()
         
-        # 💡 5. CONTROL DE SESIÓN ABIERTA: Revisar si aparece el aviso de sesión existente
+        # 5. CONTROL DE SESIÓN ABIERTA
         print("[Acción] Verificando si existe una sesión previa abierta...")
-        await asyncio.sleep(2.0) # Breve respiro para que aparezca el popup si lo hubiera
+        await asyncio.sleep(3.0) 
         try:
-            # `nodriver` permite buscar elementos por su texto directamente de forma muy limpia
+            # Usamos find para buscar la palabra Continuar
             btn_continuar = await page.find("Continuar", timeout=3)
             if btn_continuar:
                 print("[¡ALERTA!] Se detectó una sesión previa abierta. Haciendo clic en 'Continuar'...")
                 await btn_continuar.click()
                 await asyncio.sleep(2.0)
         except Exception:
-            # Si no aparece el aviso, el flujo sigue con normalidad
-            print("[OK] No hay alertas de sesión previa. Continuando...")
+            print("[OK] No hay alertas de sesión previa o no se detectó el botón.")
 
         # 6. Monitoreo estricto del cambio de URL y componentes internos
         print("[Acción] Monitoreando el cambio de URL hacia la zona de búsqueda...")
         
         tiempo_espera_max = 20  
-        intervalo = 0.5         
+        intervalo = 1.0        
         pasos = int(tiempo_espera_max / intervalo)
         
         for _ in range(pasos):
             await asyncio.sleep(intervalo)
             
+            # Verificación 1: Por URL
             try:
                 url_actual = page.url.strip()
                 if URL_OBJETIVO in url_actual.lower() or "servicio/busqueda" in url_actual.lower():
@@ -106,8 +112,10 @@ async def iniciar_sesion(page: uc.Tab, credencial: dict) -> bool:
             except Exception:
                 pass
             
+            # Verificación 2: Por DOM (¡AQUÍ ESTABA EL BUCLE INFINITO!)
             try:
-                componente_interno = await page.select('nz-select-top-control')
+                # 💡 SOLUCIÓN: Agregamos timeout=1 para que si no lo encuentra, siga el bucle en lugar de congelarse
+                componente_interno = await page.select('nz-select-top-control', timeout=1)
                 if componente_interno:
                     print(f"[OK] Componente DOM interno detectado (URL actual: {page.url})")
                     await asyncio.sleep(1.5)
@@ -116,7 +124,6 @@ async def iniciar_sesion(page: uc.Tab, credencial: dict) -> bool:
                 pass
 
         print(f"[-] Tiempo de espera agotado ({tiempo_espera_max}s). La URL no cambió a la zona de búsqueda.")
-        print(f"[-] URL final registrada: {page.url}")
         return False
             
     except Exception as ex:
